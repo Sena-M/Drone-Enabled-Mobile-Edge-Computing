@@ -39,15 +39,32 @@ timestamps = deque(maxlen=DATA_BUFFER_SIZE)
 lock = threading.Lock()
 
 def handle_sensor(conn, addr, gui_log):
+    # Check if drone is in Return to Base mode before processing
+    if returning_to_base:
+        gui_log(f"Rejecting connection from {addr} - drone is returning to base")
+        conn.close()
+        return
+        
     sensor_id = None
-    with conn:
+    try:
         gui_log(f"Connected to sensor at {addr}")
         while True:
-            try:
-                data = conn.recv(1024)
-                if not data:
-                    break
+            # Continuously check RTB status during operation
+            if returning_to_base:
+                gui_log(f"Closing connection to {sensor_id} - drone is returning to base")
+                break
                 
+            try:
+                # Set a timeout to allow checking RTB status periodically
+                conn.settimeout(1.0)
+                try:
+                    data = conn.recv(1024)
+                    if not data:
+                        break
+                except socket.timeout:
+                    # Timeout just means no data received, continue and check RTB status
+                    continue
+                    
                 decoded = json.loads(data.decode())
                 sensor_id = decoded['sensor_id']
                 
@@ -92,61 +109,119 @@ def handle_sensor(conn, addr, gui_log):
             except json.JSONDecodeError:
                 gui_log(f"Invalid JSON from {addr}")
                 break
+            except socket.timeout:
+                # This is expected due to the timeout we set
+                continue
             except Exception as e:
                 gui_log(f"Error handling sensor data: {e}")
                 break
     
-    with lock:
-        if sensor_id and sensor_id in connected_sensors:
-            connected_sensors.remove(sensor_id)
-    
-    gui_log(f"Disconnected sensor at {addr}")
+    finally:
+        # Clean up the connection and update connected sensors list
+        with lock:
+            if sensor_id and sensor_id in connected_sensors:
+                connected_sensors.remove(sensor_id)
+                gui_log(f"Disconnected sensor at {addr}")
+        
+        try:
+            conn.close()
+        except:
+            pass
 
 def start_sensor_server(gui_log):
+    """
+    Start the TCP server to listen for sensor connections.
+    Rejects new connections when drone is in Return to Base mode.
+    """
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("0.0.0.0", SENSOR_PORT))
-    server.listen(5)
-    gui_log(f"Drone listening on port {SENSOR_PORT}")
     
-    while True:
-        try:
-            conn, addr = server.accept()
-            threading.Thread(target=handle_sensor, args=(conn, addr, gui_log)).start()
-        except Exception as e:
-            gui_log(f"Error accepting connection: {e}")
-            time.sleep(1)
+    try:
+        server.bind(("0.0.0.0", SENSOR_PORT))
+        server.listen(5)
+        gui_log(f"Drone listening on port {SENSOR_PORT}")
+        
+        # Set a timeout to allow checking RTB status periodically
+        server.settimeout(1.0)
+        
+        while True:
+            try:
+                # Check if drone is in RTB mode before accepting connections
+                if returning_to_base:
+                    # In RTB mode, don't accept new connections
+                    time.sleep(1)  # Check again after a short delay
+                    continue
+                
+                # Try to accept a connection (with timeout)
+                try:
+                    conn, addr = server.accept()
+                    # Only start a new thread if we're still not in RTB mode
+                    if not returning_to_base:
+                        threading.Thread(target=handle_sensor, args=(conn, addr, gui_log)).start()
+                    else:
+                        # If we entered RTB mode between the check and accept
+                        gui_log(f"Rejecting connection from {addr} - drone is returning to base")
+                        conn.close()
+                except socket.timeout:
+                    # This is expected due to the timeout we set
+                    continue
+                    
+            except Exception as e:
+                gui_log(f"Error in sensor server: {e}")
+                time.sleep(1)
+                
+    except Exception as e:
+        gui_log(f"Failed to start sensor server: {e}")
+        return
 
 def forward_to_central(gui_log):
     global sensor_data_buffer
-
+    
     while True:
+        # First check if we're in RTB mode - don't even try to connect in this case
+        if returning_to_base:
+            gui_log("In Return to Base mode - not connecting to central server")
+            # Store how many data points we're buffering while in RTB mode
+            with lock:
+                if sensor_data_buffer:
+                    gui_log(f"Currently buffering {len(sensor_data_buffer)} data points during RTB")
+            time.sleep(5)  # Check again after 5 seconds
+            continue
+            
+        # Only try to connect if we're not in RTB mode
         try:
             gui_log("Connecting to central server...")
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(5)  # Set timeout for connection attempts
             s.connect((CENTRAL_IP, CENTRAL_PORT))
             gui_log("Connected to central server.")
-
+            
+            # Connection successful, now enter the data forwarding loop
             while True:
+                # Check RTB status continuously
+                if returning_to_base:
+                    gui_log("Entering Return to Base mode - disconnecting from central server")
+                    break  # Exit the inner loop to close this connection
+                
+                # Process data every 5 seconds
                 time.sleep(5)
+                
                 with lock:
-                    # Skip only if there's no sensor data and we're not returning to base
-                    if not sensor_data_buffer and not returning_to_base:
+                    # Skip if there's no data to send
+                    if not sensor_data_buffer:
                         continue
-
-                    # Calculate averages only if we have sensor data
-                    avg_temp = 0
-                    avg_hum = 0
-                    all_anomalies = []
                     
-                    if sensor_data_buffer:
-                        avg_temp = sum(d["temperature"] for d in sensor_data_buffer) / len(sensor_data_buffer)
-                        avg_hum = sum(d["humidity"] for d in sensor_data_buffer) / len(sensor_data_buffer)
-                        
-                        for data in sensor_data_buffer:
-                            if 'anomalies' in data and data['anomalies']:
-                                all_anomalies.extend(data['anomalies'])
-
+                    # Calculate averages
+                    avg_temp = sum(d["temperature"] for d in sensor_data_buffer) / len(sensor_data_buffer)
+                    avg_hum = sum(d["humidity"] for d in sensor_data_buffer) / len(sensor_data_buffer)
+                    
+                    # Collect anomalies
+                    all_anomalies = []
+                    for data in sensor_data_buffer:
+                        if 'anomalies' in data and data['anomalies']:
+                            all_anomalies.extend(data['anomalies'])
+                    
+                    # Prepare payload
                     payload = {
                         "drone_id": "drone1",
                         "avg_temperature": round(avg_temp, 2),
@@ -157,21 +232,44 @@ def forward_to_central(gui_log):
                         "battery_level": battery_level,
                         "connected_sensors": list(connected_sensors)
                     }
-
+                    
                     try:
+                        # Recheck RTB status right before sending to avoid race condition
+                        if returning_to_base:
+                            gui_log("Entering Return to Base mode - canceling data transmission")
+                            break
+                            
+                        # Send data
                         s.sendall(json.dumps(payload).encode() + b"\n")
                         gui_log(f"Forwarded to Central: Avg Temp={payload['avg_temperature']}°C, Avg Humidity={payload['avg_humidity']}%, Battery={battery_level}%")
                         if all_anomalies:
                             gui_log(f"Forwarded anomalies: {len(all_anomalies)}")
+                        
+                        # Clear buffer after successful transmission
                         sensor_data_buffer = []
+                        
                     except Exception as send_error:
                         gui_log(f"Error sending to central: {send_error}")
-                        break  # Reconnect
-
+                        break  # Break inner loop to reconnect
+        
         except Exception as conn_error:
+            # Connection to central server failed
             gui_log(f"Could not connect to central: {conn_error}")
-            time.sleep(5)  # Retry
-
+            
+            # If we're not in RTB mode, wait and retry
+            if not returning_to_base:
+                time.sleep(5)  # Retry after 5 seconds
+            else:
+                # If we entered RTB mode while trying to connect, log it
+                gui_log("In Return to Base mode - pausing connection attempts to central server")
+                time.sleep(5)  # Check RTB status again after 5 seconds
+        
+        finally:
+            # Always ensure socket is closed when exiting either loop
+            try:
+                s.close()
+            except:
+                pass
 def simulate_battery(gui_log, battery_var, status_var):
     global battery_level, drone_status, returning_to_base
     
